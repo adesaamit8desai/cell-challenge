@@ -20,3 +20,7 @@ models/*.pkl
 
 # OS files
 .DS_Store 
+# Ignore temp directories and intermediate AnnData files
+perturbation_preds_*/
+!submission.h5ad
+*.h5ad 
