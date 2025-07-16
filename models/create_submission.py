@@ -31,6 +31,11 @@ from pathlib import Path
 import subprocess # For running cell-eval prep
 import tempfile
 import shutil
+import sys
+import argparse
+
+# Fix import paths
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 # Import our model and config
 from models.state_model import VirtualCellSTATE
@@ -41,7 +46,8 @@ def generate_model_predictions_anndata(
     device,
     pert_counts_df,
     gene_names_list,
-    training_adata_path # For NTCs and potentially baseline expression
+    training_adata_path, # For NTCs and potentially baseline expression
+    max_cells=None
 ):
     # This function will simulate the prediction process for the validation set
     # It needs to create an AnnData object with predictions
@@ -60,48 +66,65 @@ def generate_model_predictions_anndata(
     # For now, let's create a dummy AnnData as per the tutorial's random_predictor
     # This will be replaced by actual model inference
     
-    # Load training adata to get gene order and NTCs
+    # Load training adata to get gene order and NTCs (in backed mode for memory efficiency)
     try:
-        full_training_adata = sc.read_h5ad(training_adata_path)
-        # Ensure gene order matches
-        if not np.array_equal(full_training_adata.var_names.tolist(), gene_names_list):
-            print("Warning: Gene order in training data does not match gene_names.csv. This might cause issues.")
-            # Reorder training_adata if necessary, or handle this more robustly
-            # For now, assume gene_names_list is the canonical order
+        print("Loading training data in backed mode for memory efficiency...")
+        full_training_adata = sc.read_h5ad(training_adata_path, backed='r')
+        
+        # Extract non-targeting controls (NTCs) - limit to small sample for memory
+        ntc_mask = full_training_adata.obs['target_gene'] == 'non-targeting'
+        if ntc_mask.sum() > 0:
+            # Get a small sample of NTCs to avoid memory issues
+            ntc_indices = np.where(ntc_mask)[0]
+            if len(ntc_indices) > 100:  # Limit to 100 NTCs
+                np.random.seed(42)
+                ntc_indices = np.random.choice(ntc_indices, 100, replace=False)
             
+            # Load only the NTC subset
+            ntc_adata = full_training_adata[ntc_indices, :].to_memory()
+            
+            # Ensure NTCs have the same gene order as the model expects
+            ntc_adata = ntc_adata[:, gene_names_list].copy()
+            
+            print(f"✅ Extracted {ntc_adata.n_obs} non-targeting control cells.")
+        else:
+            print("No non-targeting controls found in training data.")
+            ntc_adata = None
+
     except Exception as e:
         print(f"Could not load training adata for NTCs: {e}. Proceeding without NTCs from training data.")
         full_training_adata = None
+        ntc_adata = None
 
-    # QUICK TEST: Only process the first 5 perturbations (remove this for full run)
-    # pert_counts_df = pert_counts_df.head(5)
-    
-    # DRY RUN: Only use first 100 genes
-    gene_names_list = gene_names_list[:100]
-    
     temp_dir = tempfile.mkdtemp(prefix="perturbation_preds_")
     temp_files = []
-    
+
+    # Add NTCs to the list of files to be merged
+    if ntc_adata is not None:
+        ntc_file = f"{temp_dir}/pert_non-targeting.h5ad"
+        ntc_adata.write_h5ad(ntc_file)
+        temp_files.append(ntc_file)
+        print(f"  Writing NTC AnnData to {ntc_file} ...")
+        print("  File written.")
+
+    # Remove the test limits for full run
+    # pert_counts_df = pert_counts_df.head(5)  # (REMOVE THIS LINE)
+    # n_cells = min(n_cells, 100)  # (REMOVE THIS LINE)
     for idx, row in pert_counts_df.iterrows():
         pert_name = row['target_gene']
         n_cells = row['n_cells']
-        
-        # Limit to 1 cell per perturbation for dry run
-        n_cells = 1
-        
+        if max_cells is not None:
+            n_cells = min(n_cells, max_cells)
         print(f"Processing perturbation {pert_name} (idx {idx}) with {n_cells} cell(s) and {len(gene_names_list)} genes...")
-        
         print("  Generating baseline expression...")
         baseline_expression_for_pert = torch.randn(n_cells, len(gene_names_list)).to(device)
         target_gene_id = torch.LongTensor([gene_names_list.index(pert_name) if pert_name in gene_names_list else 0]).to(device)
         target_gene_ids_for_pert = target_gene_id.repeat(n_cells)
-
         print("  Running model inference...")
         with torch.no_grad():
             model_predictions = model(baseline_expression_for_pert, target_gene_ids_for_pert)['expression']
         model_predictions = model_predictions.to(torch.float32)
         print("  Model inference complete.")
-        
         print("  Creating AnnData object...")
         obs_df = pd.DataFrame({
             "target_gene": [pert_name] * n_cells,
@@ -114,48 +137,47 @@ def generate_model_predictions_anndata(
             var=var_df
         )
         print("  AnnData object created.")
-        
         temp_file = f"{temp_dir}/pert_{idx}_{pert_name}.h5ad"
         print(f"  Writing AnnData to {temp_file} ...")
         predicted_adata.write_h5ad(temp_file)
         print("  File written.")
         temp_files.append(temp_file)
+        del predicted_adata, model_predictions, baseline_expression_for_pert
     
     print(f"\nAll perturbation .h5ad files written to: {temp_dir}")
     print(f"Number of files: {len(temp_files)}")
-    print("\nTo merge these into a single submission file, use the provided merge script or notebook.")
-    print("For example, in Python:")
-    print("""
-import anndata as ad
-import glob
-files = sorted(glob.glob(f'{temp_dir}/*.h5ad'))
-all_adatas = [ad.read_h5ad(f) for f in files]
-merged = ad.concat(all_adatas, axis=0, join='outer', fill_value=0)
-merged.write_h5ad('submission.h5ad')
-""")
-    print("Or use a batch merge utility if available.")
+    print("\nTo merge these into a single submission file, use the provided merge script:")
+    print(f"python models/merge_h5ad_files.py --indir {temp_dir} --outfile submission.h5ad")
     print("\nAfter merging, run cell-eval prep as usual.")
     return None
 
 
-def create_submission_file():
+def create_submission_file(start=0, end=None, max_cells=None):
     print("🚀 Preparing .h5ad submission file...")
     config = TrainingConfig()
 
     # Load necessary data
-    pert_counts_path = Path("data/pert_counts_Validation.csv") # Or test.csv for final submission
-    gene_names_path = Path("data/gene_names.csv")
-    training_adata_path = Path("data/adata_Training.h5ad") # For NTCs
-
+    pert_counts_path = Path("data/pert_counts_Validation.csv")
     if not pert_counts_path.exists():
-        print(f"❌ {pert_counts_path} not found!")
+        print(f"❌  {pert_counts_path} not found!")
         return
-    if not gene_names_path.exists():
-        print(f"❌ {gene_names_path} not found!")
+    pert_counts_df = pd.read_csv(pert_counts_path)
+    if end is not None:
+        pert_counts_df = pert_counts_df.iloc[start:end]
+    else:
+        pert_counts_df = pert_counts_df.iloc[start:]
+
+    training_adata_path = Path("data/adata_Training.h5ad")
+    if not training_adata_path.exists():
+        print(f"❌  {training_adata_path} not found!")
         return
 
-    pert_counts_df = pd.read_csv(pert_counts_path)
-    gene_names_list = pd.read_csv(gene_names_path, header=None).iloc[:, 0].tolist()
+    # Load the list of highly variable genes used during training
+    hvg_path = Path("models/highly_variable_genes.csv")
+    if not hvg_path.exists():
+        print(f"❌  {hvg_path} not found! Please run real_data_training.py first.")
+        return
+    gene_names_list = pd.read_csv(hvg_path, header=None).iloc[:, 0].tolist()
 
     # Load trained model
     model_path = Path("models/state_best_model.pt")
@@ -181,7 +203,8 @@ def create_submission_file():
         config.device,
         pert_counts_df,
         gene_names_list,
-        training_adata_path
+        training_adata_path,
+        max_cells=max_cells
     )
 
     if predicted_anndata is None:
@@ -201,7 +224,7 @@ def create_submission_file():
         subprocess.run([
             "cell-eval", "prep",
             "-i", output_h5ad_path,
-            "--genes", str(gene_names_path)
+            "--genes", str(hvg_path)
         ], check=True)
         print("✅ cell-eval prep completed successfully!")
         print(f"Your submission is ready at {output_h5ad_path.replace('.h5ad', '.prep.vcc')}")
@@ -217,4 +240,9 @@ def create_submission_file():
 
 
 if __name__ == "__main__":
-    create_submission_file()
+    parser = argparse.ArgumentParser(description="Batch submission generator for Virtual Cell Challenge.")
+    parser.add_argument('--start', type=int, default=0, help='Start index of perturbations to process (inclusive)')
+    parser.add_argument('--end', type=int, default=None, help='End index of perturbations to process (exclusive)')
+    parser.add_argument('--max_cells', type=int, default=None, help='Maximum number of cells per perturbation')
+    args = parser.parse_args()
+    create_submission_file(start=args.start, end=args.end, max_cells=args.max_cells)

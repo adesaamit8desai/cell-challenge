@@ -68,7 +68,7 @@ python models/real_data_training.py
 
 3. **Prepare the final .vcc file:**
    ```bash
-   cell-eval prep -i submission.h5ad --genes data/gene_names.csv
+   cell-eval prep -i submission.h5ad --genes models/highly_variable_genes.csv
    ```
    - This checks format and produces the `.vcc` file for submission.
 

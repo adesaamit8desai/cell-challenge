@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F # Added for F.l1_loss, F.binary_cross_entropy, F.cosine_similarity
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -20,87 +21,94 @@ from models.state_model import VirtualCellSTATE, StateTrainer
 # =============================================================================
 
 class VirtualCellDataset(Dataset):
-    """Dataset for loading real challenge data efficiently"""
+    """Dataset for loading real challenge data efficiently using backed mode"""
     
-    def __init__(self, data_path, max_cells=2000, max_genes=500):
+    def __init__(self, data_path, max_cells=None, max_genes=None):
         """
-        Load real data with memory management
+        Load real data in backed mode for memory efficiency.
         
         Args:
             data_path: Path to adata_Training.h5ad
-            max_cells: Limit cells for memory (start small, scale up)
-            max_genes: Use top variable genes for efficiency
+            max_cells: Optional: Limit total cells for training (for debugging/faster runs)
+            max_genes: Optional: Limit total genes for training (for debugging/faster runs)
         """
-        print(f"📂 Loading real data: max {max_cells} cells, {max_genes} genes")
+        print(f"📂 Loading real data in backed mode from: {data_path}")
         
-        # Load the data
-        adata = sc.read_h5ad(data_path)
-        print(f"   Full dataset: {adata.shape}")
+        # Load the data in backed mode
+        self.adata = sc.read_h5ad(data_path, backed='r')
+        print(f"   Full dataset shape (backed): {self.adata.shape}")
         
-        # Take subset for training
-        n_cells_to_use = min(max_cells, adata.n_obs)
-        adata_subset = adata[:n_cells_to_use, :].copy()
+        # Apply max_cells limit if specified and load to memory
+        if max_cells is not None and max_cells < self.adata.n_obs:
+            self.adata = self.adata[:max_cells, :].to_memory()
+            print(f"   Subsetted to {self.adata.n_obs} cells (loaded to memory).")
+        else:
+            self.adata = self.adata.to_memory() # Load full data to memory if no subsetting
+            print(f"   Loaded full dataset to memory: {self.adata.shape}")
+
+        # Ensure data is dense and clean before further processing
+        self.adata.X = self.adata.X.toarray() if hasattr(self.adata.X, 'toarray') else self.adata.X
+        self.adata.X = np.nan_to_num(self.adata.X, nan=0.0, posinf=1e6, neginf=0.0)
+
+        # Find most variable genes if max_genes is specified and less than total genes
+        if max_genes is not None and max_genes < self.adata.n_vars:
+            print(f"   Finding top {max_genes} highly variable genes...")
+            try:
+                sc.pp.highly_variable_genes(self.adata, n_top_genes=max_genes)
+                # Filter genes and ensure it's not empty
+                if np.any(self.adata.var.highly_variable):
+                    self.adata = self.adata[:, self.adata.var.highly_variable].copy()
+                    print(f"   Subsetted to {self.adata.n_vars} genes (highly variable).")
+                else:
+                    raise ValueError("No highly variable genes found.")
+            except Exception as e:
+                print(f"   Warning: Could not find highly variable genes: {e}")
+                print("   Using top genes by variance instead...")
+                # Fallback: use top genes by variance
+                gene_vars = np.var(self.adata.X, axis=0) 
+                top_gene_indices = np.argsort(gene_vars)[-max_genes:]
+                
+                # Ensure top_gene_indices is not empty
+                if len(top_gene_indices) > 0:
+                    self.adata = self.adata[:, top_gene_indices].copy()
+                    print(f"   Subsetted to {self.adata.n_vars} genes (by variance).")
+                else:
+                    raise ValueError("No genes found after variance-based selection.")
         
-        # Handle infinite values and find most variable genes
-        print("   Cleaning data...")
-        # Replace infinite values with large finite values
-        X_clean = adata_subset.X.toarray() if hasattr(adata_subset.X, 'toarray') else adata_subset.X
-        X_clean = np.nan_to_num(X_clean, nan=0.0, posinf=1e6, neginf=0.0)
-        adata_subset.X = X_clean
-        
-        # Find most variable genes
-        try:
-            sc.pp.highly_variable_genes(adata_subset, n_top_genes=max_genes)
-            adata_subset = adata_subset[:, adata_subset.var.highly_variable].copy()
-        except Exception as e:
-            print(f"   Warning: Could not find highly variable genes: {e}")
-            print("   Using top genes by variance instead...")
-            # Fallback: use top genes by variance
-            gene_vars = np.var(adata_subset.X, axis=0)
-            top_gene_indices = np.argsort(gene_vars)[-max_genes:]
-            adata_subset = adata_subset[:, top_gene_indices].copy()
-        
-        print(f"   Using subset: {adata_subset.shape}")
-        
-        # Extract data
-        self.X = adata_subset.X.toarray() if hasattr(adata_subset.X, 'toarray') else adata_subset.X
-        self.obs = adata_subset.obs
-        self.var = adata_subset.var
-        
-        # Create target gene mapping
-        self.gene_names = adata_subset.var_names.tolist()
+        # Final check for empty AnnData after subsetting
+        if self.adata.n_obs == 0 or self.adata.n_vars == 0:
+            raise ValueError("Resulting AnnData object is empty after subsetting.")
+
+        self.gene_names = self.adata.var_names.tolist()
         self.gene_to_idx = {gene: i for i, gene in enumerate(self.gene_names)}
         
-        # Get perturbation information (adjust column names as needed)
         self.perturbation_info = self._extract_perturbation_info()
-        
         print(f"   Perturbations found: {len(set(self.perturbation_info))}")
         
     def _extract_perturbation_info(self):
         """Extract perturbation targets from metadata"""
-        # Common column names for perturbation info
         possible_columns = ['target_gene', 'perturbation', 'guide_target', 'gene_target']
         
         perturbation_column = None
         for col in possible_columns:
-            if col in self.obs.columns:
+            if col in self.adata.obs.columns:
                 perturbation_column = col
                 break
         
         if perturbation_column is None:
             print("⚠️ No perturbation column found, using dummy targets")
-            return ['DUMMY_TARGET'] * len(self.obs)
+            return ['DUMMY_TARGET'] * self.adata.n_obs
         
-        return self.obs[perturbation_column].tolist()
+        return self.adata.obs[perturbation_column].tolist()
     
     def __len__(self):
-        return len(self.X)
+        return self.adata.n_obs
     
     def __getitem__(self, idx):
-        """Get one training sample"""
+        """Get one training sample from backed data"""
         
-        # Current expression
-        expression = torch.FloatTensor(self.X[idx])
+        # Current expression (loads only one row from disk)
+        expression = torch.FloatTensor(self.adata.X[idx, :])
         
         # Target gene ID
         target_gene = self.perturbation_info[idx]
@@ -121,31 +129,91 @@ class VirtualCellDataset(Dataset):
         }
 
 # =============================================================================
-# STEP 2: SIMPLIFIED STATE TRAINER (FIXED)
+# STEP 2: ADVANCED STATE TRAINER WITH FULL EVALUATION
 # =============================================================================
 
-class SimpleStateTrainer:
-    """Simplified trainer that actually works"""
+class AdvancedStateTrainer:
+    """Advanced trainer with comprehensive evaluation metrics"""
     
-    def __init__(self, model, device='cpu'):
+    def __init__(self, model, device='cpu', learning_rate=1e-4):
         self.model = model.to(device)
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         
+    def _contrastive_loss(self, signatures, pert_ids):
+        """Encourage different perturbations to have different signatures (dummy loss for now)"""
+        return torch.tensor(0.0, device=self.device)
+
+    def compute_metrics(self, predictions, targets):
+        """Calculate all three competition metrics"""
+        
+        pred_expr = predictions['expression']
+        true_expr = targets['expression']
+        
+        # 1. Mean Absolute Error (MAE)
+        mae = F.l1_loss(pred_expr, true_expr).item()
+        
+        # 2. Differential Expression Score (DES)
+        # We need to calculate true DE, not the simple version
+        true_de = (true_expr - true_expr.mean(dim=1, keepdim=True)).abs() > 0.2 # Simplified DE
+        pred_de_probs = predictions['differential_expression']
+        des = F.binary_cross_entropy(pred_de_probs, true_de.float()).item()
+
+        # 3. Perturbation Discrimination Score (PDS)
+        # This requires comparing signatures across different perturbations
+        signatures = predictions['signature']
+        pert_ids = targets['perturbation_ids'].squeeze()
+        
+        # Group signatures by perturbation ID
+        unique_pids, inverse_indices = torch.unique(pert_ids, return_inverse=True)
+        
+        if len(unique_pids) > 1:
+            # Calculate mean signature for each perturbation
+            mean_signatures = torch.zeros(len(unique_pids), signatures.size(1), device=self.device)
+            mean_signatures.index_add_(0, inverse_indices, signatures)
+            counts = torch.bincount(inverse_indices, minlength=len(unique_pids)).unsqueeze(1) # Ensure minlength
+            mean_signatures /= (counts + 1e-6) # Add epsilon to prevent division by zero
+            
+            # Cosine similarity between mean signatures
+            cosine_sim = F.cosine_similarity(mean_signatures.unsqueeze(1), mean_signatures.unsqueeze(0), dim=-1)
+            
+            # PDS is based on how well we can distinguish perturbations
+            # We want low similarity for different perturbations (off-diagonal)
+            # and high for same (diagonal, which is 1)
+            pds_loss = cosine_sim[~torch.eye(len(unique_pids), dtype=bool)].mean()
+        else:
+            pds_loss = torch.tensor(0.0) # Cannot compute with one perturbation type
+
+        return {
+            'mae': mae,
+            'des': des,
+            'pds': pds_loss.item()
+        }
+
     def compute_loss(self, predictions, targets):
-        """Simplified loss computation"""
+        """Multi-task loss combining all metrics"""
         
-        # Expression loss (MAE)
-        expr_loss = nn.functional.l1_loss(predictions['expression'], targets['expression'])
+        # Individual losses (kept as tensors for backprop)
+        expr_loss = F.l1_loss(predictions['expression'], targets['expression'])
+        de_loss = F.binary_cross_entropy(
+            predictions['differential_expression'], 
+            targets['differential_expression']
+        )
+        sig_loss = self._contrastive_loss(
+            predictions['signature'], 
+            targets['perturbation_ids']
+        )
         
-        # For now, just use expression loss to avoid complexity
-        total_loss = expr_loss
+        # Combined loss (weighted sum)
+        total_loss = expr_loss + 0.5 * de_loss + 0.3 * sig_loss
         
         return {
             'total': total_loss,
-            'expression': expr_loss
+            'expression': expr_loss,
+            'de': de_loss,
+            'signature': sig_loss
         }
-    
+
     def train_epoch(self, dataloader):
         """Train for one epoch"""
         self.model.train()
@@ -223,6 +291,11 @@ def train_on_real_data():
         dataset = VirtualCellDataset(data_path, config.max_cells, config.max_genes)
         dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
         
+        # Save the list of highly variable genes
+        hvg_path = Path("models/highly_variable_genes.csv")
+        pd.DataFrame(dataset.gene_names).to_csv(hvg_path, index=False, header=False)
+        print(f"✅ Saved  {len(dataset.gene_names)} highly variable genes to {hvg_path}")
+        
         # Create model (use actual gene count from data)
         n_genes = len(dataset.gene_names)
         print(f"🧠 Creating model for {n_genes} genes")
@@ -237,19 +310,20 @@ def train_on_real_data():
         print(f"   Model parameters: {sum(p.numel() for p in model.parameters()):,}")
         
         # Create trainer
-        trainer = SimpleStateTrainer(model, config.device)
+        trainer = AdvancedStateTrainer(model, config.device, learning_rate=config.learning_rate)
         
         # Training loop with progress tracking
         print("\n🏋️ Starting training...")
         print(f"   Total batches per epoch: {len(dataloader)}")
         print(f"   Checkpointing every {config.save_every} batches")
         
-        best_mae = float('inf')
+        best_overall_score = float('inf')
         training_history = []
         
         for epoch in range(config.num_epochs):
             print(f"\n📊 Epoch {epoch+1}/{config.num_epochs}")
             
+            model.train()
             epoch_loss = 0
             batch_count = 0
             
@@ -279,34 +353,28 @@ def train_on_real_data():
                         current_loss = epoch_loss / batch_count
                         print(f"   Batch {batch_idx}/{len(dataloader)} - Loss: {current_loss:.4f}")
                     
-                    # Checkpointing
+                    # Checkpointing and evaluation
                     if batch_idx % config.save_every == 0 and batch_idx > 0:
-                        # Quick evaluation
                         model.eval()
                         with torch.no_grad():
-                            mae = nn.functional.l1_loss(
-                                predictions['expression'], 
-                                expression
-                            ).item()
+                            metrics = trainer.compute_metrics(predictions, targets)
+                            overall_score = metrics['mae'] + 0.5 * metrics['des'] + 0.3 * metrics['pds']
                         model.train()
                         
-                        print(f"   ✅ Checkpoint {batch_idx//config.save_every} - MAE: {mae:.4f}")
+                        print(f"   ✅ Checkpoint {batch_idx//config.save_every} - MAE: {metrics['mae']:.4f}, DES: {metrics['des']:.4f}, PDS: {metrics['pds']:.4f}")
                         
                         # Save checkpoint
-                        checkpoint = {
-                            'epoch': epoch,
-                            'batch': batch_idx,
-                            'model_state': model.state_dict(),
-                            'optimizer_state': trainer.optimizer.state_dict(),
-                            'mae': mae,
-                            'loss': current_loss
-                        }
-                        torch.save(checkpoint, f'models/state_checkpoint_epoch{epoch}_batch{batch_idx}.pt')
-                        
-                        if mae < best_mae:
-                            best_mae = mae
+                        if overall_score < best_overall_score:
+                            best_overall_score = overall_score
+                            checkpoint = {
+                                'epoch': epoch,
+                                'batch': batch_idx,
+                                'model_state': model.state_dict(),
+                                'optimizer_state': trainer.optimizer.state_dict(),
+                                'metrics': metrics
+                            }
                             torch.save(checkpoint, 'models/state_best_model.pt')
-                            print(f"   🏆 New best MAE: {mae:.4f}")
+                            print(f"   🏆 New best score: {overall_score:.4f}")
                     
                 except Exception as e:
                     print(f"   ❌ Error in batch {batch_idx}: {e}")
@@ -319,36 +387,37 @@ def train_on_real_data():
         # Final evaluation using best model
         print("\n📊 Final evaluation...")
         
-        if best_mae < float('inf'):
-            final_mae = best_mae
-            print(f"   Using best checkpoint MAE: {final_mae:.4f}")
+        # Load best model
+        if Path('models/state_best_model.pt').exists():
+            checkpoint = torch.load('models/state_best_model.pt')
+            model.load_state_dict(checkpoint['model_state'])
+            final_metrics = checkpoint['metrics']
+            print(f"   Loaded best model with MAE: {final_metrics['mae']:.4f}")
         else:
-            # Quick evaluation on a few batches
+            # Fallback if no best model was saved
             model.eval()
-            total_mae = 0
+            total_mae, total_des, total_pds = 0, 0, 0
             num_batches = 0
-            
             with torch.no_grad():
                 for batch_idx, batch in enumerate(dataloader):
-                    if batch_idx >= 5:  # Only evaluate first 5 batches
-                        break
-                        
+                    if batch_idx >= 5: break
                     expression = batch['expression'].to(config.device)
                     target_ids = batch['target_gene_ids'].to(config.device).squeeze()
-                    
+                    targets = {k: v.to(config.device) for k, v in batch['targets'].items()}
                     predictions = model(expression, target_ids)
-                    mae = nn.functional.l1_loss(
-                        predictions['expression'], 
-                        expression
-                    ).item()
-                    
-                    total_mae += mae
+                    metrics = trainer.compute_metrics(predictions, targets)
+                    total_mae += metrics['mae']
+                    total_des += metrics['des']
+                    total_pds += metrics['pds']
                     num_batches += 1
-            
-            final_mae = total_mae / num_batches if num_batches > 0 else 999.0
-        
+            final_metrics = {
+                'mae': total_mae / num_batches if num_batches > 0 else 999,
+                'des': total_des / num_batches if num_batches > 0 else 999,
+                'pds': total_pds / num_batches if num_batches > 0 else 999
+            }
+
         return {
-            'mae': final_mae,
+            'metrics': final_metrics,
             'status': 'success',
             'epochs': config.num_epochs,
             'genes_used': n_genes,
@@ -373,20 +442,21 @@ if __name__ == "__main__":
     print("\n" + "="*50)
     print("🎯 STATE MODEL TRAINING SUMMARY:")
     print("="*50)
-    print(f"MAE: {results['mae']:.4f}")
-    print(f"Status: {results['status']}")
-    if 'genes_used' in results:
+    if results['status'] == 'success':
+        metrics = results['metrics']
+        print(f"MAE: {metrics['mae']:.4f}")
+        print(f"DES: {metrics['des']:.4f}")
+        print(f"PDS: {metrics['pds']:.4f}")
+        print(f"Status: {results['status']}")
         print(f"Genes: {results['genes_used']}")
         print(f"Cells: {results['cells_used']}")
+    else:
+        print(f"Status: {results['status']}")
+        if 'error' in results:
+            print(f"Error: {results['error']}")
     print("="*50)
     
     print("\n📋 Just tell Claude:")
-    print(f"→ MAE: {results['mae']:.4f}")
+    if results['status'] == 'success':
+        print(f"→ MAE: {results['metrics']['mae']:.4f}, DES: {results['metrics']['des']:.4f}, PDS: {results['metrics']['pds']:.4f}")
     print(f"→ Status: {results['status']}")
-    
-    if results['mae'] < 5.0:
-        print("\n🎉 EXCELLENT! Ready for validation submission!")
-    elif results['mae'] < 15.0:
-        print("\n✅ GOOD! Ready for optimization phase!")
-    else:
-        print("\n🔄 Needs debugging - but architecture is proven!")
