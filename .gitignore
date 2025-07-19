@@ -7,20 +7,43 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 .ipynb_checkpoints/
 
-# Data
+# Data files (large datasets)
 data/
 *.h5ad
 *.csv
 
-# Models
+# Model checkpoints (large files)
 models/*.pt
 models/*.pkl
 
-# OS files
-.DS_Store 
-# Ignore temp directories and intermediate AnnData files
+# Training outputs
+training_runs/*/checkpoint_*.pt
+training_runs/*/model_*.pt
+
+# Temporary files
+temp_*/
 perturbation_preds_*/
-!submission.h5ad
-*.h5ad 
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Large submission files (keep only .vcc files)
+submissions/*.h5ad
+submissions/*.csv
+
+# Keep essential files
+!submissions/*.vcc
+!models/highly_variable_genes.csv 

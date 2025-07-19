@@ -291,11 +291,6 @@ def train_on_real_data():
         dataset = VirtualCellDataset(data_path, config.max_cells, config.max_genes)
         dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
         
-        # Save the list of highly variable genes
-        hvg_path = Path("models/highly_variable_genes.csv")
-        pd.DataFrame(dataset.gene_names).to_csv(hvg_path, index=False, header=False)
-        print(f"✅ Saved  {len(dataset.gene_names)} highly variable genes to {hvg_path}")
-        
         # Create model (use actual gene count from data)
         n_genes = len(dataset.gene_names)
         print(f"🧠 Creating model for {n_genes} genes")
