@@ -19,9 +19,13 @@ data/
 models/*.pt
 models/*.pkl
 
-# Training outputs
+# Training outputs (large model files)
 training_runs/*/checkpoint_*.pt
 training_runs/*/model_*.pt
+training_runs/*/scaled_model_final.pt
+training_runs/*/state_best_model.pt
+training_runs/*/phase_1_best_model.pt
+training_runs/*/phase_1_checkpoint.pt
 
 # Temporary files
 temp_*/
