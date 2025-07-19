@@ -18,6 +18,19 @@ This directory contains all generated submission files for the Virtual Cell Chal
 - **Generation Date**: July 18, 2024
 - **Validation**: Passes cell-eval prep validation
 
+### **submission_v3.prep.vcc** (Version 3 - FIXED)
+- **Size**: 14.1MB
+- **Model**: Scaled transformer with proper gene mapping
+- **Status**: ✅ Valid competition submission
+- **Generation Date**: July 19, 2024
+- **Validation**: Passes all requirements
+- **Key Fixes**: 
+  - ✅ Correct gene count: 18,080 genes (was 500)
+  - ✅ Proper data type: float32
+  - ✅ Includes NTC cells: 100 cells
+  - ✅ Total cells: 5,100 (within 100,000 limit)
+  - ✅ Proper gene names and structure
+
 ## Submission Pipeline
 
 ### **Generation Process**
